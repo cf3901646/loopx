@@ -143,6 +143,10 @@ def serve_runner_owned_provider_gateway(
     The returned URL and request surface contain no upstream credential. The
     caller owns the stronger process/filesystem boundary between this gateway
     and the agent runtime.
+
+    A request_lifetime factory captures the caller binding before connection
+    setup; its context is entered only for the admitted POST send. The factory
+    must not retain authority locks while DNS/TCP/CONNECT/TLS can block.
     """
 
     upstream = _validated_upstream(upstream_base_url)
@@ -220,7 +224,14 @@ def serve_runner_owned_provider_gateway(
             connection = _upstream_connection(upstream, timeout_sec=request_timeout_sec, proxy=proxy)
             response_started = False
             try:
-                with request_lifetime(observed) if request_lifetime is not None else nullcontext():
+                lifetime = request_lifetime(observed) if request_lifetime is not None else nullcontext()
+                if request_lifetime is not None:
+                    # Pin the request's owner before any slow connection work,
+                    # then leave DNS/TCP/CONNECT/TLS outside its authority lock.
+                    # Reconnection during POST would reintroduce that lock hold.
+                    connection.connect()
+                    connection.auto_open = 0
+                with lifetime:
                     # Keep the caller's original lifetime/authority through the
                     # actual send, not through the potentially long response.
                     observed["forwarded"] = None  # A send failure may still have reached the upstream.

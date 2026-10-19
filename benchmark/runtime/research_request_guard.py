@@ -90,7 +90,7 @@ class ResearchRequestGuard:
     def serve(self):
         target = urlsplit(self.env["OPENAI_BASE_URL"])
         proxy = None
-        if not proxy_bypass_environment(target.hostname or "", {"no": self.env.get("NO_PROXY", self.env.get("no_proxy", ""))}):
+        if not proxy_bypass_environment(target.netloc, {"no": self.env.get("NO_PROXY", self.env.get("no_proxy", ""))}):
             key = "HTTPS_PROXY" if target.scheme == "https" else "HTTP_PROXY"
             proxy = self.env.get(key, self.env.get(key.lower()))
         with serve_runner_owned_provider_gateway(upstream_base_url=self.env["OPENAI_BASE_URL"],

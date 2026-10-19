@@ -9,6 +9,7 @@ import time
 from types import SimpleNamespace
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -45,7 +46,8 @@ def test_wait_at_request_boundary_has_no_upstream_effect_and_retains_lineage(tmp
         env = dict(os.environ, LOOPX_TURN=turn, LOOPX_REGISTRY=str(registry),
             LOOPX_RUNTIME_ROOT=str(runtime), LOOPX_PROJECT=str(project), LOOPX_GOAL_ID=fixture.GOAL_ID,
             LOOPX_AGENT_ID=fixture.AGENT_ID, LOOPX_PHASE_DEADLINE_EPOCH=str(time.time() + 180),
-            OPENAI_BASE_URL=url, OPENAI_API_KEY="fixture-credential")
+            OPENAI_BASE_URL=url, OPENAI_API_KEY="fixture-credential",
+            NO_PROXY=urlsplit(url).netloc, HTTP_PROXY="http://127.0.0.1:1")
         guard = ResearchRequestGuard(env, receipt, wake)
         process = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(180)"],
                                    start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

@@ -291,6 +291,7 @@ class SForgeWorker(CodexAgent):
                 checkpoint_request=self.checkpoint_request,
                 task_objective=self.task_objective,
                 research_loop=self.research_loop,
+                **({"research_feedback_root": f"{_CONTROL}/native-feedback"} if self.research_loop else {}),
                 **({"goal_id": self.warm_start.goal_id, "agent_id": self.warm_start.agent_id,
                     "defer_codex_home": True} if self.warm_start is not None else {}),
             )
@@ -343,6 +344,8 @@ class SForgeWorker(CodexAgent):
                 f"Path({str(hook)!r}).read_bytes(); Path('/etc/codex/hooks.json').read_bytes()"], user="agent")
             if result.exit_code:
                 raise RuntimeError("Best-only Codex delivery hooks are unreadable by worker")
+        if self.research_loop:
+            self._install_native_research_feedback(backend, handle)
         (log_dir / "worker-profile.json").write_text(json.dumps({
             "profile": self.profile, "model": self._config.agent_model,
             **({"research_loop": True} if self.research_loop else {}),
@@ -365,6 +368,60 @@ class SForgeWorker(CodexAgent):
             **(self.runtime._replan_receipt() if self.runtime and
                self.profile.startswith("heartbeat-") else {}),
         }, indent=2))
+
+    def _install_native_research_feedback(self, backend, handle):
+        from .research_submission import instrument_submit_script
+        from .research_feedback_sync import FEEDBACK_ROOT
+
+        if getattr(backend, "research_feedback", None) is None:
+            raise ValueError("research_loop requires the native accepted-snapshot observer on RecordingDockerBackend")
+        capability = backend.exec_run(handle, [f"{_PYTHON}/bin/python3", "-c",
+            "from loopx.capabilities.explore.result_writeback import record_observer_result_attachment; "
+            "from benchmark.edgebench.research_feedback import archive_manifest"],
+            environment={"PYTHONPATH": _SRC, "LOOPX_USAGE_PING": "0"}, user="agent")
+        if capability.exit_code:
+            raise RuntimeError("Native research feedback requires a matching Explore observer capability in the pinned product source")
+        native = backend.exec_run(handle, ["cat", "/usr/local/bin/sforge-submit"], user="root")
+        if native.exit_code:
+            raise RuntimeError("The native submission entrypoint is unavailable")
+        script = instrument_submit_script(native.output, ["env", f"PYTHONPATH={_SRC}",
+            f"{_PYTHON}/bin/python3", "-m", "benchmark.runtime.research_submission"], FEEDBACK_ROOT)
+        directories = [f"{FEEDBACK_ROOT}/{name}" for name in ("intents", "snapshots", "probes", "ingestion")]
+        for command in (["mkdir", "-p", *directories],
+                        ["chown", "agent:agent", *directories],
+                        ["chmod", "0700", *directories],
+                        ["touch", f"{FEEDBACK_ROOT}/submission.lock"],
+                        ["chown", "agent:agent", f"{FEEDBACK_ROOT}/submission.lock"]):
+            if backend.exec_run(handle, command, user="root").exit_code:
+                raise RuntimeError("Could not prepare the native research evidence owner")
+        with tempfile.TemporaryDirectory(prefix="native-research-client-") as directory:
+            path = Path(directory) / "sforge-submit"
+            path.write_text(script, encoding="utf-8")
+            path.chmod(0o755)
+            backend.copy_to_container(handle, path, PurePosixPath("/usr/local/bin/sforge-submit"))
+        if backend.exec_run(handle, ["chmod", "0755", "/usr/local/bin/sforge-submit"], user="root").exit_code:
+            raise RuntimeError("The research submission entrypoint is not executable")
+
+    def _prepare_native_research_consumer(self, env):
+        from .research_feedback_sync import FEEDBACK_ROOT, feedback_owner_environment
+
+        owner = feedback_owner_environment(env)
+        with tempfile.TemporaryDirectory(prefix="native-research-owner-") as directory:
+            path = Path(directory) / "owner.json"
+            path.write_text(json.dumps(owner, sort_keys=True), encoding="utf-8")
+            path.chmod(0o644)
+            self.backend.copy_to_container(self.handle, path, PurePosixPath(f"{FEEDBACK_ROOT}/owner.json"))
+
+        def consume(backend, handle, _packet):
+            # The runner keeps observing while the scheduler is sleeping. A
+            # failed writeback is retried before any dependency is released.
+            result = backend.exec_run_with_timeout(handle,
+                ["timeout", "--signal=TERM", "--kill-after=5", "60s",
+                 f"{_PYTHON}/bin/python3", "-m", "benchmark.runtime.research_feedback_sync",
+                 "--root", FEEDBACK_ROOT], timeout=70, environment=owner, user="agent")
+            if result.exit_code or result.timed_out:
+                raise RuntimeError("Native feedback consumption is incomplete")
+        self.backend.research_feedback.after_publish = consume
 
     def format_run_cmd(self, prompt_path, *, model=None, cwd="", internet=True, resume=False):
         if self.workspace_instructions is not None and not self.instructions_installed and self.warm_start is None:
@@ -421,6 +478,8 @@ class SForgeWorker(CodexAgent):
                     raise RuntimeError("Could not protect fresh receiver credentials")
             self.prepared = True
         env = self.runtime._worker_env(cwd=self.cwd)
+        if self.research_loop:
+            self._prepare_native_research_consumer(env)
         if self.warm_start is not None:
             env["LOOPX_WARM_START"] = f"{_CONTROL}/warm-start.json"
         command = worker_command(env, python=f"{_PYTHON}/bin/python3", source=_SRC,
@@ -504,4 +563,6 @@ class SForgeWorker(CodexAgent):
             self.backend.execution_start_marker = execution_start_marker
         if self.feedback == "best-only":
             self.backend.start_feedback(self.handle)
+        if self.research_loop:
+            self.backend.research_feedback.start(self.backend, self.handle)
         return command

@@ -84,17 +84,58 @@ def run_probe(*, command: list[str], candidate_files: list[Path], output: Path,
             record.write(json.dumps({"ok": False, "reason": "candidate_changed_during_probe",
                                      "before_sha256": before, "after_sha256": after}))
             raise ValueError("candidate changed during the probe; preserve this attempt and rerun a fixed candidate")
-        if diagnostics is not None and diagnostics.exists():
-            if diagnostics.stat().st_size > 4096:
-                raise ValueError("solver diagnostics exceed the bounded observation size")
-            reported = json.loads(diagnostics.read_text(encoding="utf-8"))
-            if not isinstance(reported, dict) or set(reported) - {"search_iterations", "stop_reason"}:
-                raise ValueError("solver diagnostics accept only search_iterations and stop_reason")
-            observation["search_iterations"] = reported.get("search_iterations")
-            if reported.get("stop_reason") is not None and not timed_out:
-                observation["stop_reason"] += "; solver_report:" + str(reported["stop_reason"])
+        # Host measurements stand independently of the optional solver report.
+        # Validate them first, so a malformed/unavailable report cannot erase a
+        # completed execution or change its real exit/timeout status.
         result = normalize_execution_observation(observation)
-        record.write(json.dumps(result, ensure_ascii=False, allow_nan=False) + "\n")
+        try:
+            if diagnostics is not None:
+                try:
+                    if diagnostics.exists():
+                        if not diagnostics.is_file():
+                            raise ValueError("solver diagnostics must be a regular file")
+                        with diagnostics.open("rb") as stream:
+                            raw = stream.read(4097)
+                        if len(raw) > 4096:
+                            raise ValueError("solver diagnostics exceed the bounded observation size")
+                        reported = json.loads(raw)
+                        if not isinstance(reported, dict) or set(reported) - {"search_iterations", "stop_reason"}:
+                            raise ValueError("solver diagnostics accept only search_iterations and stop_reason")
+                        proposed = dict(result, search_iterations=reported.get("search_iterations"))
+                        reason = reported.get("stop_reason")
+                        if reason is not None:
+                            if not isinstance(reason, str):
+                                raise ValueError("solver stop_reason must be text or null")
+                            proposed["stop_reason"] += "; solver_report:" + reason
+                        checked = normalize_execution_observation(proposed)
+                        if timed_out:
+                            checked["stop_reason"] = "host_timeout"
+                        result = checked
+                except Exception as error:
+                    # Confined to optional diagnostics, never candidate checks
+                    # or process execution. Retain a bounded local explanation
+                    # without copying raw solver text or exception paths.
+                    detail = dict(source="solver_diagnostics", error_kind=type(error).__name__,
+                        candidate_sha256=before, probe_evidence_ref=evidence_ref,
+                        message="Optional solver diagnostics are invalid or unavailable; solver measurements remain unknown.")
+                    encoded = json.dumps(detail, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+                    with output.with_suffix(output.suffix + ".diagnostics-error.json").open("xb") as error_record:
+                        error_record.write(encoded)
+                    result["evidence_refs"].append("diagnostics-error:" + hashlib.sha256(encoded).hexdigest())
+                    result = normalize_execution_observation(result)
+        finally:
+            # Even failure to retain the diagnostic explanation leaves the
+            # independently valid host observation available to its caller.
+            record.write(json.dumps(result, ensure_ascii=False, allow_nan=False) + "\n")
+            record.flush()
+            os.fsync(record.fileno())
+    feedback_root = os.environ.get("LOOPX_RESEARCH_FEEDBACK_ROOT")
+    if feedback_root:
+        from .research_submission import register_probe
+
+        # The observation must be fully persisted before it becomes a source
+        # for matching a later native accepted archive/released result.
+        register_probe(Path(feedback_root), result, {"candidate_sha256": before, "files": files})
     return result
 
 

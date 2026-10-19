@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -48,12 +49,108 @@ def test_missing_solver_telemetry_stays_unknown_and_timeout_is_host_observed(tmp
 
 
 def test_probe_refuses_changed_candidate_and_never_reuses_existing_evidence(tmp_path, monkeypatch):
+    feedback_root = tmp_path / "feedback"
+    monkeypatch.setenv("LOOPX_RESEARCH_FEEDBACK_ROOT", str(feedback_root))
     with pytest.raises(ValueError, match="candidate changed"):
         probe(tmp_path, monkeypatch, source="from pathlib import Path; Path(__file__).write_text('print(0)')")
     before = (tmp_path / "observation.json").read_bytes()
     with pytest.raises(FileExistsError):
         probe(tmp_path, monkeypatch)
     assert (tmp_path / "observation.json").read_bytes() == before
+    assert not feedback_root.exists(), "a changed/unexecuted candidate cannot register as a completed probe"
+
+
+@pytest.mark.parametrize("reported", [
+    "{",
+    '{"search_iterations":"unknown","stop_reason":"search_cap"}',
+    '{"search_iterations":2,"stop_reason":{"unexpected":"value"}}',
+    '{"unexpected":"do-not-retain-raw-diagnostic-body"}',
+    "x" * 4097,
+])
+def test_invalid_optional_diagnostics_preserve_host_measurements_and_bounded_error_evidence(tmp_path, monkeypatch, reported):
+    observed = probe(tmp_path, monkeypatch, source=(
+        "import os; from pathlib import Path; "
+        f"Path(os.environ['LOOPX_RESEARCH_DIAGNOSTICS']).write_text({reported!r}); "
+        "print('work completed'); raise SystemExit(3)"))
+    assert observed["elapsed_seconds"] > 0
+    assert observed["exit_code"] == 3 and observed["stop_reason"] == "process_exit:3"
+    assert observed["search_iterations"] is None
+    assert (tmp_path / "observation.json.stdout").read_text().strip() == "work completed"
+    assert json.loads((tmp_path / "observation.json").read_text()) == observed
+    raw_error = (tmp_path / "observation.json.diagnostics-error.json").read_bytes()
+    assert len(raw_error) < 1024 and b"do-not-retain-raw-diagnostic-body" not in raw_error
+    detail = json.loads(raw_error)
+    assert detail["source"] == "solver_diagnostics"
+    assert detail["candidate_sha256"] == observed["candidate_sha256"]
+    assert "diagnostics-error:" + hashlib.sha256(raw_error).hexdigest() in observed["evidence_refs"]
+
+
+def test_invalid_solver_report_cannot_hide_a_host_timeout(tmp_path, monkeypatch):
+    observed = probe(tmp_path, monkeypatch, source=(
+        "import os,time; from pathlib import Path; "
+        "Path(os.environ['LOOPX_RESEARCH_DIAGNOSTICS']).write_text('{'); time.sleep(10)"), limit_seconds=1)
+    assert observed["stop_reason"] == "host_timeout" and observed["exit_code"] < 0
+    assert observed["search_iterations"] is None and observed["elapsed_seconds"] >= 1
+    assert (tmp_path / "observation.json.diagnostics-error.json").is_file()
+
+
+def test_persisted_probe_auto_registers_and_binds_late_native_feedback(tmp_path, monkeypatch):
+    from benchmark.runtime import research_submission
+    from benchmark.tests.test_native_research_feedback import (
+        LocalCopyBackend, archive_bytes, native_http, submit_fixture,
+    )
+
+    register = research_submission.register_probe
+    registrations = []
+
+    def register_after_persist(root, observed, manifest):
+        assert json.loads((tmp_path / "observation.json").read_text()) == observed
+        assert json.loads((tmp_path / "observation.json.candidate.json").read_text()) == manifest
+        registrations.append(root)
+        return register(root, observed, manifest)
+
+    monkeypatch.setattr(research_submission, "register_probe", register_after_persist)
+    with native_http(tmp_path) as (_state, release, observer, root):
+        monkeypatch.setenv("LOOPX_RESEARCH_FEEDBACK_ROOT", str(root))
+        observed = probe(tmp_path, monkeypatch)
+        assert registrations == [root]
+        [registered] = list((root / "probes").glob("*.json"))
+        assert json.loads(registered.read_text())["observation"] == observed
+        assert "result_ref" not in observed, "a completed local probe does not invent a native result"
+        source = tmp_path / "candidate.py"
+        accepted = submit_fixture(observer, archive_bytes({"candidate.py": source.read_bytes()}))
+        pending = observer.update(LocalCopyBackend(), None)
+        assert research_submission.bind_execution_observations(root, pending) == []
+        source.write_text("print('newer candidate')")
+        release(accepted["submission_id"], score=0)
+        packet = observer.update(LocalCopyBackend(), None)
+        [bound] = research_submission.bind_execution_observations(root, packet)
+        assert bound["submission_id"] == accepted["submission_id"]
+        assert bound["execution_observation"]["result_candidate_sha256"] == observed["candidate_sha256"]
+        assert source.read_text() == "print('newer candidate')"
+
+
+def test_probe_without_feedback_root_does_not_register(tmp_path, monkeypatch):
+    from benchmark.runtime import research_submission
+
+    monkeypatch.delenv("LOOPX_RESEARCH_FEEDBACK_ROOT", raising=False)
+
+    def unexpected(*_args):
+        raise AssertionError("feature-off probe must not create a native registration")
+
+    monkeypatch.setattr(research_submission, "register_probe", unexpected)
+    assert probe(tmp_path, monkeypatch)["exit_code"] == 0
+
+
+def test_registration_failure_preserves_the_completed_observation(tmp_path, monkeypatch):
+    feedback_root = tmp_path / "unavailable-feedback"
+    feedback_root.write_text("an existing non-directory")
+    monkeypatch.setenv("LOOPX_RESEARCH_FEEDBACK_ROOT", str(feedback_root))
+    with pytest.raises(FileExistsError):
+        probe(tmp_path, monkeypatch)
+    observed = json.loads((tmp_path / "observation.json").read_text())
+    assert observed["exit_code"] == 0 and observed["elapsed_seconds"] > 0
+    assert observed["search_iterations"] == 2
 
 
 def test_probe_cli_preserves_a_failed_candidate_exit_and_its_observation(tmp_path):

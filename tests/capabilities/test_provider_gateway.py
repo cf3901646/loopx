@@ -99,6 +99,26 @@ def test_runner_owned_gateway_rejects_non_model_paths_without_upstream_call() ->
     assert observed == {}
 
 
+def test_explicit_http_proxy_preserves_endpoint_and_https_tunnel_target():
+    from urllib.parse import urlsplit
+    from loopx.capabilities.benchmark_toolkit.provider_gateway import _upstream_connection
+
+    with _recording_upstream() as (proxy, observed):
+        origin = urlsplit(proxy)
+        proxy_url = f"http://{origin.hostname}:{origin.port}"
+        with serve_runner_owned_provider_gateway(upstream_base_url="http://127.0.0.1:1/v1",
+                upstream_bearer_token="fixture-proxy-credential", upstream_proxy_url=proxy_url) as gateway:
+            with urllib.request.urlopen(urllib.request.Request(gateway.base_url + "/responses", data=b"{}"), timeout=5) as response:
+                assert json.load(response) == {"ok": True}
+        assert observed["path"] == "http://127.0.0.1:1/v1/responses"
+        assert observed["authorization"] == "Bearer " + "fixture-proxy-credential"
+        connection = _upstream_connection(urlsplit("https://model.example.invalid/v1"),
+            timeout_sec=5, proxy=urlsplit(proxy_url))
+        assert connection.host == origin.hostname and connection.port == origin.port
+        assert connection._tunnel_host == "model.example.invalid" and connection._tunnel_port == 443
+        connection.close()
+
+
 @pytest.mark.parametrize(
     "upstream",
     (

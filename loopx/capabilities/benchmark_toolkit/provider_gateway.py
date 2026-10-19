@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import http.client
 import json
+import re
 import threading
-from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+import time
+import uuid
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import SplitResult, urlsplit
@@ -46,6 +49,35 @@ _CLIENT_CREDENTIAL_HEADERS = {
 }
 
 
+class ProviderGatewayRequestRejected(RuntimeError):
+    """The caller's existing admission owner refused this new provider effect."""
+
+
+def _observed_id(value):
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value) else None
+
+
+def _native_request_identity(headers):
+    # Codex supplies Turn metadata separately from the Responses body. Decode
+    # only the identity fields observed at the native request boundary; never
+    # retain its installation, user, model, prompt or environment metadata.
+    raw = headers.get("x-codex-turn-metadata", "")
+    try:
+        metadata = json.loads(raw) if len(raw) <= 8192 else {}
+    except (ValueError, TypeError):
+        metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    def identity(*values):
+        observed = {_observed_id(value) for value in values} - {None}
+        return next(iter(observed)) if len(observed) == 1 else None
+    return {
+        "native_session_id": identity(headers.get("session-id"), headers.get("session_id"), metadata.get("session_id")),
+        "native_thread_id": identity(headers.get("thread-id"), metadata.get("thread_id")),
+        "native_turn_id": identity(headers.get("x-codex-turn-id"), metadata.get("turn_id")),
+    }
+
+
 def _validated_upstream(value: str) -> SplitResult:
     parsed = urlsplit(value.rstrip("/"))
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -77,12 +109,18 @@ def _validated_allowed_paths(values: Sequence[str]) -> tuple[str, ...]:
 
 
 def _upstream_connection(
-    parsed: SplitResult, *, timeout_sec: float
+    parsed: SplitResult, *, timeout_sec: float, proxy: SplitResult | None = None
 ) -> http.client.HTTPConnection:
     host = parsed.hostname
     if host is None:  # Defensive narrowing; _validated_upstream rejects this.
         raise ValueError("upstream_base_url must include a host")
     port = parsed.port
+    if proxy is not None:
+        if parsed.scheme == "https":
+            connection = http.client.HTTPSConnection(proxy.hostname, proxy.port or 80, timeout=timeout_sec)
+            connection.set_tunnel(host, port or 443)
+            return connection
+        return http.client.HTTPConnection(proxy.hostname, proxy.port or 80, timeout=timeout_sec)
     if parsed.scheme == "https":
         return http.client.HTTPSConnection(host, port, timeout=timeout_sec)
     return http.client.HTTPConnection(host, port, timeout=timeout_sec)
@@ -96,6 +134,9 @@ def serve_runner_owned_provider_gateway(
     allowed_paths: Sequence[str] = _DEFAULT_ALLOWED_PATHS,
     request_timeout_sec: float = 600,
     max_request_bytes: int = 64 * 1024 * 1024,
+    upstream_proxy_url: str | None = None,
+    request_lifetime: Callable[[dict], AbstractContextManager] | None = None,
+    observe_request: Callable[[dict], None] | None = None,
 ) -> Iterator[RunnerOwnedProviderGateway]:
     """Serve a loopback-only Responses API gateway for one benchmark run.
 
@@ -105,6 +146,10 @@ def serve_runner_owned_provider_gateway(
     """
 
     upstream = _validated_upstream(upstream_base_url)
+    proxy = urlsplit(upstream_proxy_url) if upstream_proxy_url else None
+    if proxy is not None and (proxy.scheme != "http" or not proxy.hostname or proxy.username or proxy.password
+                             or proxy.query or proxy.fragment or proxy.path not in ("", "/")):
+        raise ValueError("upstream proxy must be an explicit credential-free HTTP proxy")
     token = str(upstream_bearer_token)
     if not token.strip():
         raise ValueError("upstream_bearer_token must be non-empty")
@@ -143,9 +188,20 @@ def serve_runner_owned_provider_gateway(
                 self._json_error(413, "provider_gateway_request_size_invalid")
                 return
             body = self.rfile.read(content_length)
+            request_id = "request-" + uuid.uuid4().hex
+            observed = {"request_id": request_id, "path": requested.path,
+                # Only explicitly received transport identities; no inference
+                # from timestamps, messages, tokens or request body contents.
+                "client_request_id": _observed_id(self.headers.get("x-client-request-id") or self.headers.get("x-request-id")),
+                **_native_request_identity(self.headers),
+                "upstream_request_id": None, "forwarded": False, "status": None,
+                "response_bytes": 0}
+            started = time.monotonic()
             upstream_path = f"{upstream.path.rstrip('/')}{requested.path}"
             if requested.query:
                 upstream_path = f"{upstream_path}?{requested.query}"
+            if proxy is not None and upstream.scheme == "http":
+                upstream_path = f"{upstream.scheme}://{upstream.netloc}{upstream_path}"
             headers = {
                 key: value
                 for key, value in self.headers.items()
@@ -159,11 +215,22 @@ def serve_runner_owned_provider_gateway(
             }
             headers["Authorization"] = f"Bearer {token}"
             headers["Content-Length"] = str(len(body))
-            connection = _upstream_connection(upstream, timeout_sec=request_timeout_sec)
+            if observe_request is not None:
+                headers["X-LoopX-Request-Id"] = request_id
+            connection = _upstream_connection(upstream, timeout_sec=request_timeout_sec, proxy=proxy)
             response_started = False
             try:
-                connection.request("POST", upstream_path, body=body, headers=headers)
+                with request_lifetime(observed) if request_lifetime is not None else nullcontext():
+                    # Keep the caller's original lifetime/authority through the
+                    # actual send, not through the potentially long response.
+                    observed["forwarded"] = None  # A send failure may still have reached the upstream.
+                    if observe_request is not None:
+                        observe_request({**observed, "event": "dispatch"})
+                    connection.request("POST", upstream_path, body=body, headers=headers)
+                    observed["forwarded"] = True
                 response = connection.getresponse()
+                observed["status"] = response.status
+                observed["upstream_request_id"] = _observed_id(response.getheader("x-request-id"))
                 self.send_response(response.status, response.reason)
                 for key, value in response.getheaders():
                     if key.lower() not in {
@@ -173,9 +240,13 @@ def serve_runner_owned_provider_gateway(
                         self.send_header(key, value)
                 self.end_headers()
                 response_started = True
-                while chunk := response.read(64 * 1024):
+                while chunk := response.read1(64 * 1024):
+                    observed["response_bytes"] += len(chunk)
                     self.wfile.write(chunk)
                     self.wfile.flush()
+            except ProviderGatewayRequestRejected:
+                observed["status"] = 409
+                self._json_error(409, "provider_gateway_current_admission_refused")
             except (OSError, http.client.HTTPException):
                 if not response_started and not self.wfile.closed:
                     self._json_error(502, "provider_gateway_upstream_unavailable")
@@ -183,6 +254,8 @@ def serve_runner_owned_provider_gateway(
                     self.close_connection = True
             finally:
                 connection.close()
+                if observe_request is not None:
+                    observe_request({**observed, "event": "finished", "elapsed_seconds": time.monotonic() - started})
 
         def do_GET(self) -> None:
             self._json_error(405, "provider_gateway_method_not_admitted")

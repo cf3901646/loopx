@@ -94,6 +94,23 @@ def test_only_official_delegates_continuation_to_sforge(profile, resumes, monkey
         assert 'web_search="disabled"' in command
 
 
+def test_research_loop_uses_one_explicit_profile_and_rejects_conflicting_controls():
+    pytest.importorskip("sforge")
+    pytest.importorskip("harbor")
+    from sforge.harness.config import SForgeConfig
+    from benchmark.runtime.sforge import SForgeWorker
+
+    config = SForgeConfig(agent_model="fixture", agent_effort="high",
+        agent_api_base_url="https://model.example.invalid/v1", agent_api_key="fixture-credential")
+    worker = SForgeWorker(config, profile="heartbeat-explore", cwd="/task", research_loop=True)
+    assert worker.research_loop and worker.stride_strategy == "evidence_conditioned_v1"
+    for options in ({"stride_strategy": "off"}, {"profile": "official"}, {"warm_start": object()}):
+        with pytest.raises(ValueError):
+            SForgeWorker(config, **{"profile": "heartbeat-explore", "cwd": "/task", "research_loop": True, **options})
+    ordinary = SForgeWorker(config, profile="heartbeat-explore", cwd="/task")
+    assert ordinary.research_loop is False and ordinary.stride_strategy is None
+
+
 def test_invalid_worker_inputs_fail_before_install(monkeypatch):
     pytest.importorskip("sforge")
     pytest.importorskip("harbor")

@@ -129,6 +129,8 @@ def _validate_run_data(row, config, summary, points):
             raise ValueError(f"Settings identity mismatch: {key}")
     runner, profile = config["runner"], config["worker_profile"]
     _validate_feedback_payload(runner, profile)
+    if runner.get("research_loop") != profile.get("research_loop"):
+        raise ValueError("Settings profile disagrees with research-loop treatment")
     if (
         runner["runner_commit"] != row["runner_revision"]
         or runner["model"] != row["model_id"]
@@ -337,6 +339,9 @@ def export(runs_root: Path, selection: list, output: Path, *, observed_at: str):
         if "planning_horizon_goal" in receipt:
             config["runner"]["planning_horizon_goal"] = receipt["planning_horizon_goal"]
             config["worker_profile"]["planning_horizon_goal"] = profile["planning_horizon_goal"]
+        if "research_loop" in receipt:
+            config["runner"]["research_loop"] = receipt["research_loop"]
+            config["worker_profile"]["research_loop"] = profile["research_loop"]
         if "stride_strategy" in receipt:
             config["runner"]["stride_strategy"] = receipt["stride_strategy"]
             config["worker_profile"]["stride_strategy"] = profile["stride_strategy"]

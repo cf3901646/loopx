@@ -89,6 +89,7 @@ class SForgeWorker(CodexAgent):
                  feedback: str = "native",
                  workspace_instructions: str | None = None,
                  task_objective: str | None = None,
+                 research_loop: bool = False,
                  task_entry: str | None = None,
                  turn_envelope: bool = False,
                  native_goal_continue: bool = False,
@@ -107,6 +108,12 @@ class SForgeWorker(CodexAgent):
         ):
             raise ValueError("turn_envelope requires a heartbeat worker")
         self.turn_envelope = turn_envelope
+        if not isinstance(research_loop, bool) or (research_loop and (
+                profile != "heartbeat-explore" or feedback != "native" or not config.agent_api_base_url)):
+            raise ValueError("research_loop requires heartbeat-explore, native feedback and a custom model endpoint")
+        if research_loop and warm_start is not None:
+            raise ValueError("research_loop must be admitted as a fresh treatment, not added to an old checkpoint")
+        self.research_loop = research_loop
         if timeout_seconds <= PHASE_WORK_RESERVE_SECONDS:
             raise ValueError("Worker budget must exceed the 160s startup/settlement reserve")
         if not config.agent_model or not config.agent_effort:
@@ -139,6 +146,9 @@ class SForgeWorker(CodexAgent):
             replan_after_turns = DEFAULT_REPLAN_AFTER_TURNS
         self.replan_after_turns = replan_after_turns
         self.replan_after_todos = replan_after_todos
+        from .research_loop import research_stride_strategy
+
+        stride_strategy = research_stride_strategy(research_loop, stride_strategy)
         if stride_strategy is not None and not profile.startswith("heartbeat-"):
             raise ValueError("stride_strategy requires a heartbeat profile")
         if stride_strategy is not None:
@@ -280,6 +290,7 @@ class SForgeWorker(CodexAgent):
                 checkpoint_request_path=self.checkpoint_request_path,
                 checkpoint_request=self.checkpoint_request,
                 task_objective=self.task_objective,
+                research_loop=self.research_loop,
                 **({"goal_id": self.warm_start.goal_id, "agent_id": self.warm_start.agent_id,
                     "defer_codex_home": True} if self.warm_start is not None else {}),
             )
@@ -334,6 +345,7 @@ class SForgeWorker(CodexAgent):
                 raise RuntimeError("Best-only Codex delivery hooks are unreadable by worker")
         (log_dir / "worker-profile.json").write_text(json.dumps({
             "profile": self.profile, "model": self._config.agent_model,
+            **({"research_loop": True} if self.research_loop else {}),
             "task_entry": self.task_entry,
             "reasoning_effort": effort, "timeout_seconds": self.timeout_seconds,
             "loopx_usage_ping_enabled": False,
